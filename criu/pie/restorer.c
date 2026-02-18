@@ -890,7 +890,7 @@ static unsigned long restore_mapping(VmaEntry *vma_entry)
 		flags &= ~MAP_ANONYMOUS;
 
 	/* See comment in premap_private_vma() for this flag change */
-	if (vma_entry_is(vma_entry, VMA_AREA_AIORING))
+	if (vma_entry_is(vma_entry, VMA_AREA_AIORING) || vma_entry_is(vma_entry, VMA_AREA_IORING))
 		flags |= MAP_ANONYMOUS;
 
 	/* A mapping of file with MAP_SHARED is up to date */
@@ -1878,7 +1878,7 @@ __visible long __export_restore_task(struct task_restore_args *args)
 	for (i = 0; i < args->vmas_n; i++) {
 		vma_entry = args->vmas + i;
 
-		if (!vma_entry_is(vma_entry, VMA_AREA_REGULAR) && !vma_entry_is(vma_entry, VMA_AREA_AIORING))
+		if (!vma_entry_is(vma_entry, VMA_AREA_REGULAR) && !vma_entry_is(vma_entry, VMA_AREA_AIORING) && !vma_entry_is(vma_entry, VMA_AREA_IORING))
 			continue;
 
 		if (vma_entry_is(vma_entry, VMA_PREMMAPED))

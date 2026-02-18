@@ -107,7 +107,8 @@ static inline bool vma_entry_is_private(VmaEntry *entry, unsigned long task_size
 		(vma_entry_is(entry, VMA_ANON_PRIVATE) || vma_entry_is(entry, VMA_FILE_PRIVATE)) &&
 		(entry->end <= task_size)) ||
 	       vma_entry_is(entry, VMA_AREA_SHSTK) ||
-	       vma_entry_is(entry, VMA_AREA_AIORING);
+	       vma_entry_is(entry, VMA_AREA_AIORING) ||
+	       vma_entry_is(entry, VMA_AREA_IORING);
 }
 
 static inline bool vma_area_is_private(struct vma_area *vma, unsigned long task_size)

@@ -82,6 +82,7 @@ static bool uprobes_vma_exists = false;
  */
 
 #define AIO_FNAME "/[aio]"
+#define IO_URING_FNAME "anon_inode:[io_uring]"
 
 /* check the @line starts with "%lx-%lx" format */
 static bool __is_vma_range_fmt(char *line)
@@ -499,6 +500,13 @@ static int vma_get_mapfile(const char *fname, struct vma_area *vma, DIR *mfd, st
 				return 0;
 			}
 
+			if ((buf.st_mode & S_IFMT) == 0 && strstr(fname, IO_URING_FNAME)) {
+				pr_info("Found io_uring mapping @%" PRIx64 "\n", vma->e->start);
+				close_safe(vm_file_fd);
+				vma->e->status = VMA_AREA_IORING;
+				return 0;
+			}
+
 			pr_err("Unknown shit %o (%s)\n", buf.st_mode, fname);
 			return -1;
 		}
@@ -907,6 +915,18 @@ int parse_smaps(pid_t pid, struct vm_area_list *vma_area_list, dump_filemap_t du
 		pr_debug("Handling VMA with the following smaps entry: %s\n", str);
 		if (handle_vma(pid, vma_area, str + path_off, map_files_dir, &vfi, &prev_vfi, &vm_file_fd))
 			goto err;
+
+		/*
+		 * io_uring VMAs may be classified as VMA_ANON_SHARED by
+		 * handle_vma if map_files open succeeds. Override them
+		 * based on the maps line name.
+		 */
+		if (!vma_entry_is(vma_area->e, VMA_AREA_IORING) &&
+		    strstr(str + path_off, "io_uring")) {
+			pr_info("Overriding VMA %lx as io_uring\n", (unsigned long)start);
+			close_safe(&vm_file_fd);
+			vma_area->e->status = VMA_AREA_IORING;
+		}
 
 		if (vma_entry_is(vma_area->e, VMA_FILE_PRIVATE) || vma_entry_is(vma_area->e, VMA_FILE_SHARED)) {
 			if (dump_filemap && dump_filemap(vma_area, vm_file_fd))

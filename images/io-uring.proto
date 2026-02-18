@@ -1,0 +1,28 @@
+// SPDX-License-Identifier: MIT
+
+syntax = "proto2";
+
+import "opts.proto";
+import "fown.proto";
+
+message io_uring_vma {
+	required uint64 addr  = 1;
+	required uint64 size  = 2;
+	required uint64 pgoff = 3;
+}
+
+message io_uring_entry {
+	required uint32		id		= 1;
+	required uint32		flags		= 2 [(criu).hex = true];
+	optional fown_entry	fown		= 3;
+	required uint32		setup_entries	= 10;
+	required uint32		setup_flags	= 11 [(criu).hex = true];
+	required uint32		sq_entries	= 12;
+	required uint32		cq_entries	= 13;
+	required uint32		features	= 14 [(criu).hex = true];
+	required uint32		sq_head		= 20;
+	required uint32		sq_tail		= 21;
+	required uint32		cq_head		= 22;
+	required uint32		cq_tail		= 23;
+	repeated io_uring_vma	vmas		= 30;
+}

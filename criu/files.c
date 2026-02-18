@@ -50,6 +50,7 @@
 #include "fdstore.h"
 #include "bpfmap.h"
 #include "pidfd.h"
+#include "io_uring.h"
 
 #include "protobuf.h"
 #include "util.h"
@@ -547,6 +548,8 @@ static int dump_one_file(struct pid *pid, int fd, int lfd, struct fd_opts *opts,
 			ops = &timerfd_dump_ops;
 		else if (is_pidfd_link(link))
 			ops = &pidfd_dump_ops;
+		else if (is_io_uring_link(link))
+			ops = &io_uring_dump_ops;
 #ifdef CONFIG_HAS_LIBBPF
 		else if (is_bpfmap_link(link))
 			ops = &bpfmap_dump_ops;
@@ -618,10 +621,9 @@ int dump_my_file(int lfd, u32 *id, int *type)
 	return 0;
 }
 
-int dump_task_files_seized(struct parasite_ctl *ctl, struct pstree_item *item, struct parasite_drain_fd *dfds)
+int dump_task_files_seized(struct parasite_ctl *ctl, struct pstree_item *item, struct parasite_drain_fd *dfds, struct cr_img *img)
 {
 	int *lfds = NULL;
-	struct cr_img *img = NULL;
 	struct fd_opts *opts = NULL;
 	int i, ret = -1;
 	int off, nr_fds = min((int)PARASITE_MAX_FDS, dfds->nr_fds);
@@ -636,10 +638,6 @@ int dump_task_files_seized(struct parasite_ctl *ctl, struct pstree_item *item, s
 
 	opts = xmalloc(nr_fds * sizeof(struct fd_opts));
 	if (!opts)
-		goto err;
-
-	img = open_image(CR_FD_FDINFO, O_DUMP, item->ids->files_id);
-	if (!img)
 		goto err;
 
 	ret = 0; /* Don't fail if nr_fds == 0 */
@@ -669,8 +667,6 @@ int dump_task_files_seized(struct parasite_ctl *ctl, struct pstree_item *item, s
 
 	pr_info("----------------------------------------\n");
 err:
-	if (img)
-		close_image(img);
 	xfree(opts);
 	xfree(lfds);
 	return ret;
@@ -1787,6 +1783,9 @@ static int collect_one_file(void *o, ProtobufCMessage *base, struct cr_img *i)
 		break;
 	case FD_TYPES__PIDFD:
 		ret = collect_one_file_entry(fe, fe->pidfd->id, &fe->pidfd->base, &pidfd_cinfo);
+		break;
+	case FD_TYPES__IO_URING:
+		ret = collect_one_file_entry(fe, fe->iou->id, &fe->iou->base, &io_uring_cinfo);
 		break;
 #ifdef CONFIG_HAS_LIBBPF
 	case FD_TYPES__BPFMAP:

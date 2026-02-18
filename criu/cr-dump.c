@@ -84,6 +84,7 @@
 #include "timens.h"
 #include "img-streamer.h"
 #include "pidfd-store.h"
+#include "io_uring.h"
 #include "apparmor.h"
 #include "asm/dump.h"
 #include "timer.h"
@@ -233,16 +234,22 @@ static int check_thread_rseq(pid_t tid, const struct parasite_check_rseq *ti_rse
 
 struct cr_imgset *glob_imgset;
 
+static int *io_uring_fds;
+static int nr_io_uring_fds;
+
 static int collect_fds(pid_t pid, struct parasite_drain_fd **dfds)
 {
 	struct dirent *de;
 	DIR *fd_dir;
 	int size = 0;
 	int n;
+	char link[32];
 
 	pr_info("\n");
 	pr_info("Collecting fds (pid: %d)\n", pid);
 	pr_info("----------------------------------------\n");
+
+	nr_io_uring_fds = 0;
 
 	fd_dir = opendir_proc(pid, "fd");
 	if (!fd_dir)
@@ -250,8 +257,34 @@ static int collect_fds(pid_t pid, struct parasite_drain_fd **dfds)
 
 	n = 0;
 	while ((de = readdir(fd_dir))) {
+		int fd_num;
+
 		if (dir_dots(de))
 			continue;
+
+		fd_num = atoi(de->d_name);
+
+		/* Check if this is an io_uring fd — skip from parasite drain */
+		{
+			ssize_t len = readlinkat(dirfd(fd_dir), de->d_name,
+						 link, sizeof(link) - 1);
+			if (len > 0) {
+				link[len] = '\0';
+			} else {
+				link[0] = '\0';
+			}
+		}
+		if (is_io_uring_link(link)) {
+			io_uring_fds = xrealloc(io_uring_fds,
+						(nr_io_uring_fds + 1) * sizeof(int));
+			if (!io_uring_fds) {
+				closedir(fd_dir);
+				return -1;
+			}
+			io_uring_fds[nr_io_uring_fds++] = fd_num;
+			pr_info("Found io_uring fd %d (will bypass parasite)\n", fd_num);
+			continue;
+		}
 
 		if (sizeof(struct parasite_drain_fd) + sizeof(int) * (n + 1) > size) {
 			struct parasite_drain_fd *t;
@@ -265,11 +298,11 @@ static int collect_fds(pid_t pid, struct parasite_drain_fd **dfds)
 			*dfds = t;
 		}
 
-		(*dfds)->fds[n++] = atoi(de->d_name);
+		(*dfds)->fds[n++] = fd_num;
 	}
 
 	(*dfds)->nr_fds = n;
-	pr_info("Found %d file descriptors\n", n);
+	pr_info("Found %d file descriptors (%d io_uring)\n", n + nr_io_uring_fds, nr_io_uring_fds);
 	pr_info("----------------------------------------\n");
 
 	closedir(fd_dir);
@@ -1694,16 +1727,36 @@ static int dump_one_task(struct pstree_item *item, InventoryEntry *parent_ie)
 	}
 
 	if (dfds) {
-		ret = dump_task_files_seized(parasite_ctl, item, dfds);
+		struct cr_img *fdinfo_img;
+
+		fdinfo_img = open_image(CR_FD_FDINFO, O_DUMP, item->ids->files_id);
+		if (!fdinfo_img) {
+			ret = -1;
+			goto err_cure;
+		}
+
+		ret = dump_task_files_seized(parasite_ctl, item, dfds, fdinfo_img);
 		if (ret) {
 			pr_err("Dump files (pid: %d) failed with %d\n", pid, ret);
+			close_image(fdinfo_img);
 			goto err_cure;
 		}
 		ret = flush_eventpoll_dinfo_queue();
 		if (ret) {
 			pr_err("Dump eventpoll (pid: %d) failed with %d\n", pid, ret);
+			close_image(fdinfo_img);
 			goto err_cure;
 		}
+		if (nr_io_uring_fds > 0) {
+			ret = dump_io_uring_fds(pid, io_uring_fds, nr_io_uring_fds,
+						fdinfo_img);
+			if (ret) {
+				pr_err("Dump io_uring (pid: %d) failed with %d\n", pid, ret);
+				close_image(fdinfo_img);
+				goto err_cure;
+			}
+		}
+		close_image(fdinfo_img);
 	}
 
 	mdc.pre_dump = false;
