@@ -209,7 +209,8 @@ static void parse_vma_vmflags(char *buf, struct vma_area *vma_area)
 	 * The uprobes vma is also mapped by the kernel with VM_IO, among other flags
 	 */
 	if (io_pf && !vma_area_is(vma_area, VMA_AREA_VVAR) && !vma_entry_is(vma_area->e, VMA_FILE_SHARED)
-		  && !vma_area_is(vma_area, VMA_AREA_UPROBES))
+		  && !vma_area_is(vma_area, VMA_AREA_UPROBES)
+		  && !vma_area_is(vma_area, VMA_AREA_IORING))
 		vma_area->e->status |= VMA_UNSUPP;
 
 	if (vma_area->e->madv)
