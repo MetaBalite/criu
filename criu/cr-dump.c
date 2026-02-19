@@ -1735,6 +1735,16 @@ static int dump_one_task(struct pstree_item *item, InventoryEntry *parent_ie)
 			goto err_cure;
 		}
 
+		/* Dump io_uring fds first — epoll may reference them */
+		if (nr_io_uring_fds > 0) {
+			ret = dump_io_uring_fds(pid, io_uring_fds, nr_io_uring_fds,
+						fdinfo_img);
+			if (ret) {
+				pr_err("Dump io_uring (pid: %d) failed with %d\n", pid, ret);
+				close_image(fdinfo_img);
+				goto err_cure;
+			}
+		}
 		ret = dump_task_files_seized(parasite_ctl, item, dfds, fdinfo_img);
 		if (ret) {
 			pr_err("Dump files (pid: %d) failed with %d\n", pid, ret);
@@ -1746,15 +1756,6 @@ static int dump_one_task(struct pstree_item *item, InventoryEntry *parent_ie)
 			pr_err("Dump eventpoll (pid: %d) failed with %d\n", pid, ret);
 			close_image(fdinfo_img);
 			goto err_cure;
-		}
-		if (nr_io_uring_fds > 0) {
-			ret = dump_io_uring_fds(pid, io_uring_fds, nr_io_uring_fds,
-						fdinfo_img);
-			if (ret) {
-				pr_err("Dump io_uring (pid: %d) failed with %d\n", pid, ret);
-				close_image(fdinfo_img);
-				goto err_cure;
-			}
 		}
 		close_image(fdinfo_img);
 	}

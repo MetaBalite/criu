@@ -17,6 +17,8 @@
 #include "files.h"
 #include "bfd.h"
 
+#include "file-ids.h"
+
 #include "protobuf.h"
 #include "images/io-uring.pb-c.h"
 
@@ -232,21 +234,38 @@ static int dump_one_io_uring_fd(pid_t pid, int fd, struct cr_img *fdinfo_img)
 		iue.id, fd, iue.sq_entries, iue.cq_entries, iue.features,
 		iue.setup_flags, n_vmas);
 
-	/* Write FileEntry to shared files image */
-	fe.type = FD_TYPES__IO_URING;
-	fe.id = iue.id;
-	fe.iou = &iue;
-
-	ret = pb_write_one(img_from_set(glob_imgset, CR_FD_FILES), &fe, PB_FILE);
-	if (ret)
-		goto out;
-
-	/* Write FdinfoEntry to per-task fdinfo image */
+	/* Register in CRIU's fd tracking (epoll needs this to resolve targets) */
 	fde.type = FD_TYPES__IO_URING;
 	fde.id = iue.id;
 	fde.fd = fd;
 	fde.flags = 0;
 
+	{
+		struct fd_parms p = FD_PARMS_INIT;
+		p.stat = st;
+		p.fd = fd;
+		p.pid = pid;
+		ret = fd_id_generate(pid, &fde, &p);
+		if (ret < 0)
+			goto out;
+	}
+
+	/* fd_id_generate may update fde.id — propagate to file entry */
+	iue.id = fde.id;
+
+	/* Write FileEntry to shared files image */
+	fe.type = FD_TYPES__IO_URING;
+	fe.id = fde.id;
+	fe.iou = &iue;
+
+	if (ret == 1) {
+		/* New ID — write the file entry */
+		ret = pb_write_one(img_from_set(glob_imgset, CR_FD_FILES), &fe, PB_FILE);
+		if (ret)
+			goto out;
+	}
+
+	/* Write FdinfoEntry to per-task fdinfo image */
 	ret = pb_write_one(fdinfo_img, &fde, PB_FDINFO);
 out:
 	xfree(vma_ptrs);
