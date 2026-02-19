@@ -110,8 +110,11 @@ static bool should_dump_entire_vma(VmaEntry *vmae)
 		return true;
 	if (vma_entry_is(vmae, VMA_AREA_AIORING))
 		return true;
-	if (vma_entry_is(vmae, VMA_AREA_IORING))
-		return true;
+	/*
+	 * io_uring pages are VM_PFNMAP (kernel-mapped) and can't be
+	 * vmspliced with SPLICE_F_GIFT. Skip dumping them — restore
+	 * creates fresh rings with new pages via io_uring_setup().
+	 */
 
 	return false;
 }
@@ -305,7 +308,7 @@ prep_dump_pages_args(struct parasite_ctl *ctl, struct vm_area_list *vma_area_lis
 		 * Kernel write to aio ring is not soft-dirty tracked,
 		 * so we ignore them at pre-dump.
 		 */
-		if ((vma_entry_is(vma->e, VMA_AREA_AIORING) || vma_entry_is(vma->e, VMA_AREA_IORING)) && skip_non_trackable)
+		if (vma_entry_is(vma->e, VMA_AREA_AIORING) && skip_non_trackable)
 			continue;
 		/*
 		 * We totally ignore MAP_HUGETLB on pre-dump.
@@ -495,7 +498,7 @@ static int generate_vma_iovs(struct pstree_item *item, struct vma_area *vma, str
 	 * parent images from pre-dump stages. Instead, the content is restored from
 	 * the parasite context using full memory image.
 	 */
-	if (vma_entry_is(vma->e, VMA_AREA_AIORING) || vma_entry_is(vma->e, VMA_AREA_IORING) || vma->e->flags & MAP_HUGETLB) {
+	if (vma_entry_is(vma->e, VMA_AREA_AIORING) || vma->e->flags & MAP_HUGETLB) {
 		if (pre_dump)
 			return 0;
 		has_parent = false;
@@ -942,7 +945,7 @@ static int premap_private_vma(struct pstree_item *t, struct vma_area *vma, void 
 		 * Restore AIO ring buffer content to temporary anonymous area.
 		 * This will be placed in io_setup'ed AIO in restore_aio_ring().
 		 */
-		if (vma_entry_is(vma->e, VMA_AREA_AIORING) || vma_entry_is(vma->e, VMA_AREA_IORING))
+		if (vma_entry_is(vma->e, VMA_AREA_AIORING))
 			flag |= MAP_ANONYMOUS;
 		else if (vma_area_is(vma, VMA_FILE_PRIVATE)) {
 			ret = vma->vm_open(vpid(t), vma);
