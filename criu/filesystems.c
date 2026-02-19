@@ -230,8 +230,11 @@ static int binfmt_misc_dump_from_child(void *arg)
 	}
 
 	mnt_fd = mount_detached_fs("binfmt_misc");
-	if (mnt_fd < 0)
-		return 1;
+	if (mnt_fd < 0) {
+		/* Target namespace can't mount binfmt_misc — no entries to dump */
+		dump_arg->n = 0;
+		return 0;
+	}
 
 	fd = openat(mnt_fd, ".", O_DIRECTORY | O_RDONLY);
 	if (fd < 0) {
