@@ -99,13 +99,24 @@ static int parse_io_uring_fdinfo(pid_t pid, int fd,
 		}
 	}
 
-	if (parsed < 6) {
-		pr_err("Failed to parse io_uring fdinfo (got %d/6 fields)\n", parsed);
-		goto out;
+	/*
+	 * Kernel 5.15 only outputs SqThread/UserFiles/UserBufs.
+	 * Kernel 6.x adds SqMask/CqMask/SqHead/SqTail/CqHead/CqTail/Features.
+	 * For fresh ring restore, we only need entries count which we can
+	 * derive from VMA sizes if fdinfo doesn't provide it.
+	 */
+	if (parsed >= 6) {
+		*sq_entries = sq_mask + 1;
+		*cq_entries = cq_mask + 1;
+	} else {
+		/* Defaults — will be refined from VMA sizes by caller */
+		*sq_entries = 0;
+		*cq_entries = 0;
+		*sq_head = 0;
+		*sq_tail = 0;
+		*cq_head = 0;
+		*cq_tail = 0;
 	}
-
-	*sq_entries = sq_mask + 1;
-	*cq_entries = cq_mask + 1;
 
 	bclose(&f);
 	return 0;
@@ -214,6 +225,26 @@ static int dump_one_io_uring_fd(pid_t pid, int fd, struct cr_img *fdinfo_img)
 
 	if (collect_io_uring_vmas(pid, st.st_ino, &vmas, &n_vmas))
 		return -1;
+
+	/*
+	 * If fdinfo didn't provide sq_entries (kernel 5.15), derive from
+	 * the SQE VMA size: entries = vma_size / sizeof(struct io_uring_sqe).
+	 * sizeof(io_uring_sqe) is 64 bytes.
+	 */
+	if (iue.sq_entries == 0 && n_vmas > 0) {
+		for (i = 0; i < n_vmas; i++) {
+			if (vmas[i].pgoff == 0x10000000ULL) { /* IORING_OFF_SQES */
+				iue.sq_entries = vmas[i].size / 64;
+				iue.cq_entries = iue.sq_entries * 2;
+				break;
+			}
+		}
+		if (iue.sq_entries == 0) {
+			pr_err("Can't determine io_uring sq_entries from VMAs\n");
+			goto out;
+		}
+		pr_info("Derived sq_entries=%u from SQE VMA size\n", iue.sq_entries);
+	}
 
 	iue.id = make_gen_id((uint32_t)st.st_dev, (uint32_t)st.st_ino, 0);
 	iue.flags = 0;
