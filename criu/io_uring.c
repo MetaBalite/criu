@@ -29,7 +29,7 @@
 #undef LOG_PREFIX
 #define LOG_PREFIX "io_uring: "
 
-#define MAX_IO_URING_VMAS 3
+#define MAX_IO_URING_VMAS 8
 
 struct io_uring_info {
 	IoUringEntry *iue;
@@ -159,7 +159,7 @@ static int collect_io_uring_vmas(pid_t pid, unsigned long inode,
 			   &dev_maj, &dev_min, &ino) != 7)
 			continue;
 
-		if (ino != inode)
+		if (inode != 0 && ino != inode)
 			continue;
 
 		if (n >= MAX_IO_URING_VMAS) {
@@ -223,7 +223,11 @@ static int dump_one_io_uring_fd(pid_t pid, int fd, struct cr_img *fdinfo_img)
 				  &iue.features, &iue.setup_flags))
 		return -1;
 
-	if (collect_io_uring_vmas(pid, st.st_ino, &vmas, &n_vmas))
+	/*
+	 * On kernel 5.15 all io_uring fds share the same anon_inode,
+	 * so we can't filter VMAs by inode. Pass 0 to skip inode filter.
+	 */
+	if (collect_io_uring_vmas(pid, 0, &vmas, &n_vmas))
 		return -1;
 
 	/*
