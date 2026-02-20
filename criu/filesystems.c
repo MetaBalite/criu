@@ -420,8 +420,14 @@ int binfmt_misc_restore_sandboxed(pid_t pid, BinfmtMiscEntry **bmes, size_t n)
 	}
 
 	mnt_fd = mount_detached_fs("binfmt_misc");
-	if (mnt_fd < 0)
-		return -1;
+	if (mnt_fd < 0) {
+		/* Can't mount binfmt_misc in target namespace (e.g., container
+		 * without CAP_SYS_ADMIN). Skip restore — binfmt_misc entries
+		 * are not critical for application functionality.
+		 */
+		pr_warn("Can't mount binfmt_misc for restore, skipping\n");
+		return 0;
+	}
 
 	buf = xmalloc(BINFMT_MISC_STR);
 	if (!buf) {
