@@ -11,11 +11,14 @@
 #include <compel/infect.h>
 
 #include <ctype.h>
+#include <dirent.h>
 #include <fcntl.h>
 #include <stdio.h>
 #include <unistd.h>
 #include <sys/ptrace.h>
 #include <sys/wait.h>
+#include <sys/sysmacros.h>
+#include <sys/stat.h>
 
 /* cuda-checkpoint binary should live in your PATH */
 #define CUDA_CHECKPOINT "cuda-checkpoint"
@@ -46,6 +49,9 @@ typedef enum {
 bool plugin_disabled = false;
 
 bool plugin_added_to_inventory = false;
+
+/* Forward declarations */
+static int scan_and_save_nvidia_fds(int pid);
 
 struct pid_info {
 	int pid;
@@ -207,7 +213,9 @@ static int cuda_checkpoint_supports_flag(const char *flag)
 	return 1;
 }
 
-/* Retrieve the cuda restore thread TID from the root pid */
+/* Retrieve the cuda restore thread TID from the root pid.
+ * Returns -1 if the process has no CUDA context (not an error condition).
+ */
 static int get_cuda_restore_tid(int root_pid)
 {
 	char pid_buf[16];
@@ -218,6 +226,16 @@ static int get_cuda_restore_tid(int root_pid)
 	const char *args[] = { CUDA_CHECKPOINT, "--get-restore-tid", "--pid", pid_buf, NULL };
 	int ret = launch_cuda_checkpoint(args, pid_out, sizeof(pid_out));
 	if (ret != 0) {
+		/* "Could not find restore thread" means no CUDA context - this is OK, not an error.
+		 * This commonly happens for helper processes like Python's multiprocessing.resource_tracker
+		 * which are part of the process tree but have no GPU context.
+		 */
+		if (strstr(pid_out, "Could not find restore thread") != NULL ||
+		    strstr(pid_out, "not supported") != NULL ||
+		    strstr(pid_out, "no CUDA") != NULL) {
+			pr_debug("pid %d has no CUDA context (restore tid not found), skipping\n", root_pid);
+			return -1;
+		}
 		pr_err("Failed to launch cuda-checkpoint to retrieve restore tid: %s\n", pid_out);
 		return -1;
 	}
@@ -249,6 +267,13 @@ static cuda_task_state_t get_cuda_state(pid_t pid)
 	snprintf(pid_buf, sizeof(pid_buf), "%d", pid);
 
 	if (launch_cuda_checkpoint(args, state_str, sizeof(state_str))) {
+		/* Non-CUDA processes will fail here - treat as "no context" not error */
+		if (strstr(state_str, "not supported") != NULL ||
+		    strstr(state_str, "Could not") != NULL ||
+		    strstr(state_str, "no CUDA") != NULL) {
+			pr_debug("pid %d has no CUDA context (get-state failed), skipping\n", pid);
+			return CUDA_TASK_UNKNOWN;
+		}
 		pr_err("Failed to launch cuda-checkpoint to retrieve state: %s\n", state_str);
 		return CUDA_TASK_UNKNOWN;
 	}
@@ -415,14 +440,15 @@ int cuda_plugin_pause_devices(int pid)
 	restore_tid = get_cuda_restore_tid(pid);
 
 	if (restore_tid == -1) {
-		pr_info("no need to pause devices on pid %d\n", pid);
+		pr_debug("no need to pause devices on pid %d (no CUDA context)\n", pid);
 		return 0;
 	}
 
 	task_state = get_cuda_state(restore_tid);
 	if (task_state == CUDA_TASK_UNKNOWN) {
-		pr_err("Failed to get CUDA state for PID %d\n", restore_tid);
-		return -1;
+		/* Process has no valid CUDA state - skip it (not an error) */
+		pr_debug("skipping pid %d: no valid CUDA state\n", pid);
+		return 0;
 	}
 
 	if (!plugin_added_to_inventory) {
@@ -432,6 +458,13 @@ int cuda_plugin_pause_devices(int pid)
 		}
 		plugin_added_to_inventory = true;
 	}
+
+	/*
+	 * Scan and save NVIDIA device FDs BEFORE cuda-checkpoint runs.
+	 * This is critical because cuda-checkpoint will close/modify these FDs,
+	 * and CRIU won't see them during its later FD collection phase.
+	 */
+	scan_and_save_nvidia_fds(pid);
 
 	if (task_state == CUDA_TASK_LOCKED) {
 		pr_info("pid %d already in a locked state\n", pid);
@@ -530,6 +563,8 @@ interrupt:
 
 int cuda_plugin_resume_devices_late(int pid)
 {
+	int ret;
+
 	if (plugin_disabled) {
 		return -ENOTSUP;
 	}
@@ -538,10 +573,484 @@ int cuda_plugin_resume_devices_late(int pid)
 	 * Here, we assume that users expect the target process
 	 * to be in a "running" state after restore, even if it was
 	 * in a "locked" or "checkpointed" state during `criu dump`.
+	 *
+	 * If cuda-checkpoint is not available or fails, we continue anyway.
+	 * The application may be using external GPU checkpoint/restore
+	 * (e.g., via GPUCR library and SIGUSR1/SIGUSR2 signals).
 	 */
-	return resume_device(pid, 1, CUDA_TASK_RUNNING);
+	ret = resume_device(pid, 1, CUDA_TASK_RUNNING);
+	if (ret != 0) {
+		pr_warn("CUDA plugin: resume_device failed for PID %d (ret=%d), "
+			"continuing anyway (external GPU restore may be used)\n", pid, ret);
+		/* Return 0 to not fail the restore - let external restore handle it */
+		return 0;
+	}
+	return 0;
 }
 CR_PLUGIN_REGISTER_HOOK(CR_PLUGIN_HOOK__RESUME_DEVICES_LATE, cuda_plugin_resume_devices_late)
+
+/* Forward declaration - checks if a device major number is an NVIDIA device */
+static bool is_nvidia_device_major(unsigned int maj);
+
+/**
+ * Handle NVIDIA device VMAs during dump.
+ * This hook is called when CRIU encounters a device file mmap.
+ * Returning 0 tells CRIU that this plugin will handle the VMA.
+ */
+int cuda_plugin_handle_device_vma(int fd, const struct stat *st_buf)
+{
+	unsigned int major_num = major(st_buf->st_rdev);
+
+	if (is_nvidia_device_major(major_num)) {
+		pr_info("CUDA plugin handling NVIDIA device VMA (major %d, minor %d)\n",
+			major_num, minor(st_buf->st_rdev));
+
+		if (!plugin_added_to_inventory) {
+			if (add_inventory_plugin(CR_PLUGIN_DESC.name)) {
+				pr_err("Failed to add CUDA plugin to inventory\n");
+				return -1;
+			}
+			plugin_added_to_inventory = true;
+		}
+
+		return 0; /* Plugin will handle this VMA */
+	}
+
+	return -ENOTSUP; /* Not our device, let other plugins try */
+}
+CR_PLUGIN_REGISTER_HOOK(CR_PLUGIN_HOOK__HANDLE_DEVICE_VMA, cuda_plugin_handle_device_vma)
+
+/**
+ * Update VMA mapping during restore.
+ * For NVIDIA device VMAs, we return a /dev/zero mapping instead of the real device.
+ * cuda-checkpoint will restore the actual GPU state after CRIU restore completes.
+ */
+int cuda_plugin_update_vma_map(const char *path, const uint64_t addr,
+			       const uint64_t old_pgoff, uint64_t *new_pgoff, int *plugin_fd)
+{
+	static int devzero_fd = -1;
+	int dup_fd;
+
+	/* Check if this is an NVIDIA device path */
+	if (strstr(path, "/dev/nvidia") == NULL && strstr(path, "nvidia-uvm") == NULL) {
+		return -ENOTSUP; /* Not our device */
+	}
+
+	pr_debug("CUDA plugin: mapping NVIDIA VMA at 0x%lx (%s) to /dev/zero\n",
+		(unsigned long)addr, path);
+
+	/* Open /dev/zero once and keep it */
+	if (devzero_fd < 0) {
+		devzero_fd = open("/dev/zero", O_RDWR);
+		if (devzero_fd < 0) {
+			pr_perror("CUDA plugin: failed to open /dev/zero");
+			return -1;
+		}
+	}
+
+	/*
+	 * CRIU will dup and close the returned fd, so we must return a dup'd copy.
+	 * We keep devzero_fd for ourselves, and return a fresh dup each time.
+	 */
+	dup_fd = dup(devzero_fd);
+	if (dup_fd < 0) {
+		pr_perror("CUDA plugin: failed to dup /dev/zero fd");
+		return -1;
+	}
+
+	*plugin_fd = dup_fd;
+	*new_pgoff = 0;
+
+	return 1; /* Tell CRIU to use our fd */
+}
+CR_PLUGIN_REGISTER_HOOK(CR_PLUGIN_HOOK__UPDATE_VMA_MAP, cuda_plugin_update_vma_map)
+
+/**
+ * Handle NVIDIA device file descriptors during dump.
+ * NVIDIA device FDs cannot be dumped normally - they are kernel resources
+ * tied to GPU context. We tell CRIU to skip them.
+ * cuda-checkpoint will restore the GPU context on restore.
+ */
+/*
+ * NVIDIA device major numbers are dynamically allocated and can change
+ * between systems, kernel versions, and driver versions.
+ * We detect them at runtime by reading /proc/devices.
+ *
+ * Known NVIDIA device types:
+ * - nvidia, nvidiactl, nvidia-modeset (usually 195)
+ * - nvidia-uvm (dynamic, e.g., 507)
+ * - nvidia-nvswitch (dynamic, e.g., 508)
+ * - nvidia-nvlink (dynamic, e.g., 509)
+ * - nvidia-caps (dynamic, e.g., 510)
+ * - nvidia-caps-imex-channels (dynamic, e.g., 511)
+ */
+#define MAX_NVIDIA_MAJORS 16
+static int nvidia_majors[MAX_NVIDIA_MAJORS];
+static int nvidia_major_count = 0;
+static bool majors_initialized = false;
+
+static void add_nvidia_major(int major)
+{
+	/* Check if already added */
+	for (int i = 0; i < nvidia_major_count; i++) {
+		if (nvidia_majors[i] == major)
+			return;
+	}
+	if (nvidia_major_count < MAX_NVIDIA_MAJORS) {
+		nvidia_majors[nvidia_major_count++] = major;
+	}
+}
+
+static void init_nvidia_majors(void)
+{
+	FILE *f;
+	char line[256];
+
+	if (majors_initialized)
+		return;
+
+	majors_initialized = true;
+
+	f = fopen("/proc/devices", "r");
+	if (!f)
+		return;
+
+	while (fgets(line, sizeof(line), f)) {
+		int major;
+		char name[64];
+
+		if (sscanf(line, "%d %63s", &major, name) != 2)
+			continue;
+
+		/* Match any device name containing "nvidia" */
+		if (strstr(name, "nvidia") != NULL) {
+			add_nvidia_major(major);
+			pr_debug("CUDA plugin: detected NVIDIA device '%s' at major %d\n", name, major);
+		}
+	}
+
+	fclose(f);
+
+	pr_info("CUDA plugin: detected %d NVIDIA device majors\n", nvidia_major_count);
+}
+
+static bool is_nvidia_device_major(unsigned int maj)
+{
+	init_nvidia_majors();
+
+	for (int i = 0; i < nvidia_major_count; i++) {
+		if ((int)maj == nvidia_majors[i])
+			return true;
+	}
+
+	/* Fallback to common known values if detection failed */
+	if (maj == 195)  /* nvidia - usually static */
+		return true;
+
+	return false;
+}
+
+/*
+ * Save NVIDIA device file mappings to a file during dump.
+ * Format: one line per file "id path\n"
+ */
+#define NVIDIA_FILES_IMG "nvidia-files.img"
+static FILE *nvidia_files_fp = NULL;
+
+/*
+ * Get the directory path for checkpoint images (nvidia-files.img).
+ *
+ * During RPC mode:
+ * - opts.imgs_dir is set from ImagesDirFd (checkpoint directory)
+ * - opts.work_dir is set from WorkDirFd (could be /tmp for temp mounts)
+ *
+ * We MUST prefer opts.imgs_dir because that's where checkpoint images live.
+ * WorkDirFd might point to a different directory just for temp files.
+ *
+ * Falls back to CWD as last resort (CRIU chdir's during dump).
+ */
+static const char *get_images_dir(void)
+{
+	/* Primary: images directory (where checkpoint data lives) */
+	if (opts.imgs_dir && opts.imgs_dir[0]) {
+		pr_debug("CUDA plugin: using opts.imgs_dir=%s\n", opts.imgs_dir);
+		return opts.imgs_dir;
+	}
+
+	/*
+	 * Fallback: work directory (only if imgs_dir is truly empty).
+	 * During dump via RPC, work_dir may equal imgs_dir.
+	 * During restore, work_dir might be /tmp - AVOID this for images!
+	 */
+	if (opts.work_dir && opts.work_dir[0] &&
+	    strncmp(opts.work_dir, "/tmp", 4) != 0) {
+		pr_debug("CUDA plugin: using opts.work_dir=%s (imgs_dir empty)\n", opts.work_dir);
+		return opts.work_dir;
+	}
+
+	/* Last resort: current directory (CRIU chdir's to images during dump) */
+	pr_debug("CUDA plugin: using CWD (imgs_dir=%s, work_dir=%s)\n",
+		opts.imgs_dir ? opts.imgs_dir : "null",
+		opts.work_dir ? opts.work_dir : "null");
+	return ".";
+}
+
+static void save_nvidia_file_mapping(int id, const char *path)
+{
+	if (!nvidia_files_fp) {
+		char img_path[PATH_MAX];
+		const char *dir = get_images_dir();
+
+		snprintf(img_path, sizeof(img_path), "%s/%s", dir, NVIDIA_FILES_IMG);
+		pr_info("CUDA plugin: saving NVIDIA mappings to %s (dir=%s)\n", img_path, dir);
+
+		nvidia_files_fp = fopen(img_path, "w");
+		if (!nvidia_files_fp) {
+			pr_perror("Failed to create %s", img_path);
+			return;
+		}
+	}
+	fprintf(nvidia_files_fp, "%d %s\n", id, path);
+	fflush(nvidia_files_fp);
+	pr_debug("CUDA plugin: saved mapping id=0x%x -> %s\n", id, path);
+}
+
+/*
+ * Scan a process's file descriptors for NVIDIA devices and save mappings.
+ * This MUST be called BEFORE cuda-checkpoint closes the device FDs.
+ *
+ * The id format uses FD number + device info to create a unique identifier
+ * that can be matched during restore.
+ */
+static int scan_and_save_nvidia_fds(int pid)
+{
+	char fd_dir[64];
+	DIR *dir;
+	struct dirent *entry;
+	int count = 0;
+
+	snprintf(fd_dir, sizeof(fd_dir), "/proc/%d/fd", pid);
+	dir = opendir(fd_dir);
+	if (!dir) {
+		pr_perror("CUDA plugin: failed to open %s", fd_dir);
+		return -1;
+	}
+
+	while ((entry = readdir(dir)) != NULL) {
+		char fd_path[128];
+		char link_target[256];
+		struct stat st;
+		ssize_t len;
+		int fd_num;
+
+		if (entry->d_name[0] == '.')
+			continue;
+
+		fd_num = atoi(entry->d_name);
+		snprintf(fd_path, sizeof(fd_path), "/proc/%d/fd/%d", pid, fd_num);
+
+		/* Read the symlink to get the device path */
+		len = readlink(fd_path, link_target, sizeof(link_target) - 1);
+		if (len <= 0)
+			continue;
+		link_target[len] = '\0';
+
+		/* Check if it's an NVIDIA device */
+		if (strncmp(link_target, "/dev/nvidia", 11) != 0)
+			continue;
+
+		/* Stat the actual device to get major/minor */
+		if (stat(link_target, &st) < 0) {
+			pr_warn("CUDA plugin: can't stat %s\n", link_target);
+			continue;
+		}
+
+		if (!S_ISCHR(st.st_mode))
+			continue;
+
+		/* Create a unique ID from major:minor:fd */
+		unsigned int maj = major(st.st_rdev);
+		unsigned int min = minor(st.st_rdev);
+		int id = (maj << 20) | (min << 8) | (fd_num & 0xFF);
+
+		save_nvidia_file_mapping(id, link_target);
+		count++;
+
+		pr_debug("CUDA plugin: found NVIDIA fd %d -> %s (id=0x%x)\n",
+			fd_num, link_target, id);
+	}
+
+	closedir(dir);
+
+	if (count > 0) {
+		pr_info("CUDA plugin: saved %d NVIDIA device mappings for pid %d\n", count, pid);
+	}
+
+	return count;
+}
+
+int cuda_plugin_dump_file(int fd, int id)
+{
+	struct stat st;
+	char path[256];
+	char fd_link[64];
+	ssize_t len;
+
+	if (fstat(fd, &st) == -1) {
+		return -ENOTSUP; /* Can't stat, not our file */
+	}
+
+	/* Check if this is a character device with an NVIDIA major */
+	if (!S_ISCHR(st.st_mode) || !is_nvidia_device_major(major(st.st_rdev))) {
+		return -ENOTSUP; /* Not an NVIDIA device */
+	}
+
+	/*
+	 * Register this plugin in the inventory so CRIU knows to load it
+	 * during restore. This is critical - without it, the plugin will
+	 * be disabled during restore and external files won't be restored.
+	 */
+	if (!plugin_added_to_inventory) {
+		if (add_inventory_plugin(CR_PLUGIN_DESC.name))
+			return -1;
+		plugin_added_to_inventory = true;
+		pr_info("CUDA plugin: added to inventory for DUMP_EXT_FILE\n");
+	}
+
+	/* Get the actual device path */
+	snprintf(fd_link, sizeof(fd_link), "/proc/self/fd/%d", fd);
+	len = readlink(fd_link, path, sizeof(path) - 1);
+	if (len > 0) {
+		path[len] = '\0';
+		save_nvidia_file_mapping(id, path);
+	} else {
+		/* Fallback based on minor number */
+		if (minor(st.st_rdev) == 255) {
+			save_nvidia_file_mapping(id, "/dev/nvidiactl");
+		} else if (minor(st.st_rdev) == 0 && major(st.st_rdev) != 195) {
+			save_nvidia_file_mapping(id, "/dev/nvidia-uvm");
+		} else {
+			snprintf(path, sizeof(path), "/dev/nvidia%d", minor(st.st_rdev));
+			save_nvidia_file_mapping(id, path);
+		}
+	}
+
+	pr_info("CUDA plugin: marking NVIDIA device fd %d id 0x%x (%s) as external\n",
+		fd, id, path);
+
+	/* Return 0 to tell CRIU we handled this file (skip dumping it) */
+	return 0;
+}
+CR_PLUGIN_REGISTER_HOOK(CR_PLUGIN_HOOK__DUMP_EXT_FILE, cuda_plugin_dump_file)
+
+/**
+ * Restore an external NVIDIA device file.
+ * CRIU calls this during restore for each ext file we claimed during dump.
+ */
+/*
+ * Load NVIDIA device file mappings saved during dump.
+ */
+#define MAX_NVIDIA_FILES 512
+static struct {
+	int id;
+	char path[256];
+} nvidia_file_map[MAX_NVIDIA_FILES];
+static int nvidia_file_map_count = 0;
+static bool nvidia_file_map_loaded = false;
+
+static void load_nvidia_file_mappings(void)
+{
+	char img_path[PATH_MAX];
+	FILE *fp;
+	int id;
+	char path[256];
+	const char *dir;
+
+	if (nvidia_file_map_loaded)
+		return;
+	nvidia_file_map_loaded = true;
+
+	dir = get_images_dir();
+	snprintf(img_path, sizeof(img_path), "%s/%s", dir, NVIDIA_FILES_IMG);
+	pr_info("CUDA plugin: loading NVIDIA mappings from %s (dir=%s)\n", img_path, dir);
+
+	fp = fopen(img_path, "r");
+	if (!fp) {
+		pr_warn("CUDA plugin: no %s found at %s, using fallback restore\n",
+			NVIDIA_FILES_IMG, img_path);
+		return;
+	}
+
+	while (fscanf(fp, "%d %255s", &id, path) == 2) {
+		if (nvidia_file_map_count >= MAX_NVIDIA_FILES) {
+			pr_warn("CUDA plugin: too many NVIDIA files, truncating\n");
+			break;
+		}
+		nvidia_file_map[nvidia_file_map_count].id = id;
+		strncpy(nvidia_file_map[nvidia_file_map_count].path, path, 255);
+		nvidia_file_map[nvidia_file_map_count].path[255] = '\0';
+		nvidia_file_map_count++;
+	}
+	fclose(fp);
+	pr_info("CUDA plugin: loaded %d NVIDIA file mappings\n", nvidia_file_map_count);
+}
+
+static const char *find_nvidia_path_for_id(int id)
+{
+	load_nvidia_file_mappings();
+	for (int i = 0; i < nvidia_file_map_count; i++) {
+		if (nvidia_file_map[i].id == id)
+			return nvidia_file_map[i].path;
+	}
+	return NULL;
+}
+
+int cuda_plugin_restore_file(int id, bool *retry_needed)
+{
+	int fd;
+	const char *path;
+
+	*retry_needed = false;
+
+	if (plugin_disabled) {
+		pr_debug("CUDA plugin: plugin disabled, returning ENOTSUP\n");
+		return -ENOTSUP;
+	}
+
+	/* Look up the original path for this file ID */
+	path = find_nvidia_path_for_id(id);
+	if (path) {
+		fd = open(path, O_RDWR);
+		if (fd >= 0) {
+			pr_debug("CUDA plugin: restored id 0x%x as %s (fd=%d)\n", id, path, fd);
+			return fd;
+		}
+		pr_warn("CUDA plugin: can't open saved path %s for id 0x%x: %s\n",
+			path, id, strerror(errno));
+	}
+
+	/* Fallback: try common NVIDIA device paths */
+	const char *fallback_paths[] = {
+		"/dev/nvidia0",
+		"/dev/nvidiactl",
+		"/dev/nvidia-uvm",
+		"/dev/nvidia-modeset",
+		NULL
+	};
+
+	for (int i = 0; fallback_paths[i]; i++) {
+		fd = open(fallback_paths[i], O_RDWR);
+		if (fd >= 0) {
+			pr_debug("CUDA plugin: restored id 0x%x as %s (fallback, fd=%d)\n",
+				id, fallback_paths[i], fd);
+			return fd;
+		}
+	}
+
+	pr_err("CUDA plugin: can't restore id 0x%x - all paths failed\n", id);
+	return -ENOENT;
+}
+CR_PLUGIN_REGISTER_HOOK(CR_PLUGIN_HOOK__RESTORE_EXT_FILE, cuda_plugin_restore_file)
 
 /**
  * Check if a CUDA device is available on the system
@@ -582,15 +1091,13 @@ int cuda_plugin_init(int stage)
 
 	ret = cuda_checkpoint_supports_flag("--action");
 	if (ret == -1) {
+		/* cuda-checkpoint not found - this is OK if using external GPU checkpoint (gpucr) */
 		pr_warn("check that %s is present in $PATH\n", CUDA_CHECKPOINT);
-		plugin_disabled = true;
-		return 0;
-	}
-
-	if (ret == 0) {
-		pr_warn("cuda-checkpoint --action flag not supported, an r555 or higher version driver is required. Disabling CUDA plugin\n");
-		plugin_disabled = true;
-		return 0;
+		pr_info("CUDA plugin will use fallback mode (external GPU checkpoint via signals)\n");
+		/* Don't disable - allow the plugin to handle device FDs */
+	} else if (ret == 0) {
+		pr_warn("cuda-checkpoint --action flag not supported, an r555 or higher version driver is required\n");
+		/* Still continue - allow device FD handling */
 	}
 
 	pr_info("initialized: %s stage %d\n", CR_PLUGIN_DESC.name, stage);
