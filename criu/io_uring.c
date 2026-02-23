@@ -338,6 +338,8 @@ static int io_uring_open(struct file_desc *d, int *new_fd)
 {
 	struct io_uring_info *info;
 	IoUringEntry *iue;
+	struct io_uring_params params;
+	unsigned int flags;
 	int tmp;
 
 	info = container_of(d, struct io_uring_info, d);
@@ -348,26 +350,27 @@ static int io_uring_open(struct file_desc *d, int *new_fd)
 		iue->setup_flags, iue->n_vmas);
 
 	/*
-	 * Do NOT call io_uring_setup() here.
+	 * Create a temporary io_uring fd as placeholder. We need a real
+	 * io_uring fd (not /dev/null) because epoll restore calls
+	 * epoll_ctl(EPOLL_CTL_ADD) on this fd, and /dev/null doesn't
+	 * support poll — returning EPERM.
 	 *
-	 * io_uring_open() runs in the CRIU child process before the restorer
-	 * blob takes over. io_uring_setup() creates kernel-side VMAs in the
-	 * process address space. The restorer blob's unmap_old_vmas() then
-	 * destroys these VMAs while keeping the fd, leaving a ring fd with
-	 * no backing memory — causing SIGSEGV when the process resumes.
-	 *
-	 * Instead, return a placeholder fd (/dev/null). The application's
-	 * io_uring library (uvloop) will be fully reinitialized after restore
-	 * via the intercept library's SIGUSR2 handler, which creates fresh
-	 * io_uring rings with proper VMAs.
+	 * We don't mmap the ring here, so no kernel VMAs are created.
+	 * The restorer blob will create the final ring with proper VMAs
+	 * at the original addresses and dup2() it onto this fd.
 	 */
-	tmp = open("/dev/null", O_RDWR);
+	memset(&params, 0, sizeof(params));
+	flags = iue->setup_flags & ~IORING_SETUP_SQPOLL;
+	params.flags = flags;
+
+	tmp = syscall(__NR_io_uring_setup, iue->sq_entries, &params);
 	if (tmp < 0) {
-		pr_perror("Can't open /dev/null as io_uring placeholder");
+		pr_perror("Can't create io_uring placeholder (sq=%u flags=%#x)",
+			  iue->sq_entries, flags);
 		return -1;
 	}
 
-	pr_debug("  placeholder fd=%d for io_uring (will be reinitialized post-restore)\n", tmp);
+	pr_debug("  placeholder io_uring fd=%d (restorer will replace)\n", tmp);
 
 	*new_fd = tmp;
 	return 0;
