@@ -335,9 +335,7 @@ static int io_uring_open(struct file_desc *d, int *new_fd)
 {
 	struct io_uring_info *info;
 	IoUringEntry *iue;
-	struct io_uring_params params;
 	int tmp;
-	size_t i;
 
 	info = container_of(d, struct io_uring_info, d);
 	iue = info->iue;
@@ -346,86 +344,30 @@ static int io_uring_open(struct file_desc *d, int *new_fd)
 		iue->id, iue->sq_entries, iue->cq_entries, iue->features,
 		iue->setup_flags, iue->n_vmas);
 
-	memset(&params, 0, sizeof(params));
-	params.flags = iue->setup_flags;
-	/* Strip SQPOLL — kernel thread can't survive checkpoint */
-	params.flags &= ~IORING_SETUP_SQPOLL;
-	params.cq_entries = iue->cq_entries;
-	if (iue->cq_entries != iue->sq_entries * 2)
-		params.flags |= IORING_SETUP_CQSIZE;
-
-	tmp = syscall(__NR_io_uring_setup, iue->setup_entries, &params);
+	/*
+	 * Do NOT call io_uring_setup() here.
+	 *
+	 * io_uring_open() runs in the CRIU child process before the restorer
+	 * blob takes over. io_uring_setup() creates kernel-side VMAs in the
+	 * process address space. The restorer blob's unmap_old_vmas() then
+	 * destroys these VMAs while keeping the fd, leaving a ring fd with
+	 * no backing memory — causing SIGSEGV when the process resumes.
+	 *
+	 * Instead, return a placeholder fd (/dev/null). The application's
+	 * io_uring library (uvloop) will be fully reinitialized after restore
+	 * via the intercept library's SIGUSR2 handler, which creates fresh
+	 * io_uring rings with proper VMAs.
+	 */
+	tmp = open("/dev/null", O_RDWR);
 	if (tmp < 0) {
-		pr_perror("Can't create io_uring %#x (entries=%u flags=%#x)",
-			  iue->id, iue->setup_entries, params.flags);
+		pr_perror("Can't open /dev/null as io_uring placeholder");
 		return -1;
 	}
 
-	pr_debug("  created ring fd=%d sq=%u cq=%u\n",
-		 tmp, params.sq_entries, params.cq_entries);
-
-	/* Remap ring memory at original addresses */
-	for (i = 0; i < iue->n_vmas; i++) {
-		IoUringVma *v = iue->vmas[i];
-		void *addr, *kern_addr;
-
-		/*
-		 * Try MAP_FIXED first (works on kernel <=6.4).
-		 * Kernel 6.5+ rejects MAP_FIXED for io_uring, so fall
-		 * back to mmap at kernel address + memcpy to original.
-		 */
-		munmap((void *)v->addr, v->size);
-		addr = mmap((void *)v->addr, v->size,
-			    PROT_READ | PROT_WRITE,
-			    MAP_SHARED | MAP_FIXED, tmp, v->pgoff);
-		if (addr != MAP_FAILED) {
-			pr_debug("  mapped vma %#lx (MAP_FIXED)\n",
-				 (unsigned long)v->addr);
-			continue;
-		}
-
-		/*
-		 * Fallback: mmap at kernel-chosen address, then copy
-		 * fresh ring data to the original address (re-create
-		 * anonymous mapping there).
-		 */
-		kern_addr = mmap(NULL, v->size, PROT_READ | PROT_WRITE,
-				 MAP_SHARED, tmp, v->pgoff);
-		if (kern_addr == MAP_FAILED) {
-			pr_perror("Can't mmap io_uring vma pgoff %#lx",
-				  (unsigned long)v->pgoff);
-			goto err_close;
-		}
-
-		/* Re-create anonymous mapping at original address */
-		addr = mmap((void *)v->addr, v->size,
-			    PROT_READ | PROT_WRITE,
-			    MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0);
-		if (addr == MAP_FAILED) {
-			pr_perror("Can't recreate anon mapping at %#lx",
-				  (unsigned long)v->addr);
-			munmap(kern_addr, v->size);
-			goto err_close;
-		}
-
-		/* Copy fresh ring state to original address */
-		memcpy(addr, kern_addr, v->size);
-		munmap(kern_addr, v->size);
-		pr_info("  mapped vma %#lx (fallback memcpy, ring not shared)\n",
-			(unsigned long)v->addr);
-	}
-
-	if (rst_file_params(tmp, iue->fown, iue->flags)) {
-		pr_perror("Can't restore params on io_uring %#x", iue->id);
-		goto err_close;
-	}
+	pr_debug("  placeholder fd=%d for io_uring (will be reinitialized post-restore)\n", tmp);
 
 	*new_fd = tmp;
 	return 0;
-
-err_close:
-	close(tmp);
-	return -1;
 }
 
 static struct file_desc_ops io_uring_desc_ops = {
