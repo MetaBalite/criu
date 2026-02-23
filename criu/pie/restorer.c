@@ -1048,6 +1048,126 @@ populate:
 	return 0;
 }
 
+/*
+ * io_uring restore in the restorer blob.
+ *
+ * io_uring_setup() creates kernel VMAs that unmap_old_vmas() would destroy
+ * if called earlier. By running here (after VMA restore), the rings get
+ * created at the correct addresses via MAP_FIXED mmap.
+ */
+
+/* io_uring_params — defined locally since we can't include <linux/io_uring.h> in restorer blob */
+struct io_uring_params {
+	uint32_t sq_entries;
+	uint32_t cq_entries;
+	uint32_t flags;
+	uint32_t sq_thread_cpu;
+	uint32_t sq_thread_idle;
+	uint32_t features;
+	uint32_t wq_fd;
+	uint32_t resv[3];
+	struct {
+		uint32_t head;
+		uint32_t tail;
+		uint32_t ring_mask;
+		uint32_t ring_entries;
+		uint32_t flags;
+		uint32_t dropped;
+		uint32_t array;
+		uint32_t resv1;
+		uint64_t resv2;
+	} sq_off;
+	struct {
+		uint32_t head;
+		uint32_t tail;
+		uint32_t ring_mask;
+		uint32_t ring_entries;
+		uint32_t overflow;
+		uint32_t cqes;
+		uint32_t flags;
+		uint32_t resv1;
+		uint64_t resv2;
+	} cq_off;
+};
+
+#define IORING_OFF_SQ_RING  0ULL
+#define IORING_OFF_SQES     0x10000000ULL
+#define IORING_SETUP_SQPOLL (1U << 1)
+
+static int restore_io_uring_ring(struct rst_io_uring *ring)
+{
+	struct io_uring_params p;
+	unsigned int i, flags;
+	long ring_fd, ret;
+	uint32_t *sq_array;
+
+	memzero(&p, sizeof(p));
+
+	/* Strip SQPOLL — requires privileges and thread affinity we can't restore */
+	flags = ring->setup_flags & ~IORING_SETUP_SQPOLL;
+	p.flags = flags;
+	p.cq_entries = ring->cq_entries;
+
+	ring_fd = sys_io_uring_setup(ring->sq_entries, &p);
+	if (ring_fd < 0) {
+		pr_err("io_uring_setup(sq=%u, flags=%#x) failed: %ld\n",
+		       ring->sq_entries, flags, ring_fd);
+		return -1;
+	}
+
+	pr_debug("io_uring: setup fd=%ld sq=%u cq=%u (target fd=%u)\n",
+		 ring_fd, p.sq_entries, p.cq_entries, ring->fd);
+
+	/* mmap ring VMAs at original addresses */
+	for (i = 0; i < ring->n_vmas; i++) {
+		unsigned long addr = ring->vmas[i].addr;
+		unsigned long size = ring->vmas[i].size;
+		unsigned long pgoff = ring->vmas[i].pgoff;
+		long mapped;
+
+		mapped = sys_mmap((void *)addr, size,
+				  PROT_READ | PROT_WRITE,
+				  MAP_SHARED | MAP_FIXED | MAP_POPULATE,
+				  ring_fd, pgoff);
+		if (mapped != (long)addr) {
+			pr_err("io_uring mmap(addr=%lx, size=%lx, pgoff=%lx) failed: %ld\n",
+			       addr, size, pgoff, mapped);
+			sys_close(ring_fd);
+			return -1;
+		}
+	}
+
+	/* Initialize SQ array: sqarray[i] = i */
+	if (p.sq_off.array) {
+		/* Find the SQ ring VMA (pgoff == IORING_OFF_SQ_RING == 0) */
+		for (i = 0; i < ring->n_vmas; i++) {
+			if (ring->vmas[i].pgoff == IORING_OFF_SQ_RING) {
+				unsigned int j;
+				sq_array = (uint32_t *)(ring->vmas[i].addr + p.sq_off.array);
+				for (j = 0; j < p.sq_entries; j++)
+					sq_array[j] = j;
+				break;
+			}
+		}
+	}
+
+	/* Place ring fd at the correct descriptor number */
+	if ((unsigned long)ring_fd != ring->fd) {
+		ret = sys_dup2(ring_fd, ring->fd);
+		if (ret < 0) {
+			pr_err("io_uring dup2(%ld, %u) failed: %ld\n",
+			       ring_fd, ring->fd, ret);
+			sys_close(ring_fd);
+			return -1;
+		}
+		sys_close(ring_fd);
+	}
+
+	pr_info("io_uring: restored fd=%u sq=%u cq=%u vmas=%u\n",
+		ring->fd, ring->sq_entries, ring->cq_entries, ring->n_vmas);
+	return 0;
+}
+
 static void rst_tcp_repair_off(struct rst_tcp_sock *rts)
 {
 	int aux, ret;
@@ -1982,6 +2102,14 @@ __visible long __export_restore_task(struct task_restore_args *args)
 
 	for (i = 0; i < args->rings_n; i++)
 		if (restore_aio_ring(&args->rings[i]) < 0)
+			goto core_restore_end;
+
+	/*
+	 * Restore io_uring rings. Must happen after unmap_old_vmas()
+	 * since io_uring_setup() creates kernel VMAs.
+	 */
+	for (i = 0; i < args->io_urings_n; i++)
+		if (restore_io_uring_ring(&args->io_urings[i]) < 0)
 			goto core_restore_end;
 
 	/*

@@ -141,6 +141,23 @@ struct restore_vma_io {
 
 #define RIO_SIZE(niovs) (sizeof(struct restore_vma_io) + (niovs) * sizeof(struct iovec))
 
+struct rst_io_uring_vma {
+	unsigned long addr;
+	unsigned long size;
+	unsigned long pgoff;
+};
+
+#define RST_IO_URING_MAX_VMAS 4
+
+struct rst_io_uring {
+	unsigned int fd;
+	unsigned int sq_entries;
+	unsigned int cq_entries;
+	unsigned int setup_flags;
+	unsigned int n_vmas;
+	struct rst_io_uring_vma vmas[RST_IO_URING_MAX_VMAS];
+};
+
 struct task_restore_args {
 	struct thread_restore_args *t; /* thread group leader */
 
@@ -183,6 +200,9 @@ struct task_restore_args {
 
 	struct rst_aio_ring *rings;
 	unsigned int rings_n;
+
+	struct rst_io_uring *io_urings;
+	unsigned int io_urings_n;
 
 	struct rlimit64 *rlims;
 	unsigned int rlims_n;

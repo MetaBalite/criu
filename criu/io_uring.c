@@ -16,6 +16,9 @@
 #include "log.h"
 #include "files.h"
 #include "bfd.h"
+#include "pstree.h"
+#include "rst-malloc.h"
+#include "restorer.h"
 
 #include "file-ids.h"
 
@@ -389,3 +392,52 @@ struct collect_image_info io_uring_cinfo = {
 	.priv_size = sizeof(struct io_uring_info),
 	.collect = collect_one_io_uring,
 };
+
+int prepare_io_urings(struct pstree_item *t, struct task_restore_args *ta)
+{
+	struct fdinfo_list_entry *fle;
+	int count = 0;
+
+	ta->io_urings = (struct rst_io_uring *)rst_mem_align_cpos(RM_PRIVATE);
+	ta->io_urings_n = 0;
+
+	/* Walk this task's fd list to find io_uring descriptors */
+	list_for_each_entry(fle, &rsti(t)->fds, ps_list) {
+		struct io_uring_info *info;
+		struct rst_io_uring *rio;
+		IoUringEntry *iue;
+		unsigned int i;
+
+		if (fle->desc->ops->type != FD_TYPES__IO_URING)
+			continue;
+
+		info = container_of(fle->desc, struct io_uring_info, d);
+		iue = info->iue;
+
+		rio = rst_mem_alloc(sizeof(*rio), RM_PRIVATE);
+		if (!rio)
+			return -1;
+
+		rio->fd = fle->fe->fd;
+		rio->sq_entries = iue->sq_entries;
+		rio->cq_entries = iue->cq_entries;
+		rio->setup_flags = iue->setup_flags;
+		rio->n_vmas = 0;
+
+		for (i = 0; i < iue->n_vmas && i < RST_IO_URING_MAX_VMAS; i++) {
+			rio->vmas[i].addr = iue->vmas[i]->addr;
+			rio->vmas[i].size = iue->vmas[i]->size;
+			rio->vmas[i].pgoff = iue->vmas[i]->pgoff;
+			rio->n_vmas++;
+		}
+
+		pr_info("Prepared io_uring fd %d sq=%u cq=%u flags=%#x vmas=%u\n",
+			rio->fd, rio->sq_entries, rio->cq_entries,
+			rio->setup_flags, rio->n_vmas);
+
+		count++;
+	}
+
+	ta->io_urings_n = count;
+	return 0;
+}
