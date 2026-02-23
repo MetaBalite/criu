@@ -193,14 +193,13 @@ err:
 	return -1;
 }
 
-static int dump_one_io_uring_fd(pid_t pid, int fd, struct cr_img *fdinfo_img)
+static int dump_one_io_uring_fd(pid_t pid, int fd, struct cr_img *fdinfo_img,
+				IoUringVma *vmas, size_t n_vmas)
 {
 	IoUringEntry iue = IO_URING_ENTRY__INIT;
 	FdinfoEntry fde = FDINFO_ENTRY__INIT;
 	FileEntry fe = FILE_ENTRY__INIT;
-	IoUringVma *vmas = NULL;
 	IoUringVma **vma_ptrs = NULL;
-	size_t n_vmas = 0;
 	struct stat st;
 	int ret = -1;
 	size_t i;
@@ -227,13 +226,6 @@ static int dump_one_io_uring_fd(pid_t pid, int fd, struct cr_img *fdinfo_img)
 		return -1;
 
 	/*
-	 * On kernel 5.15 all io_uring fds share the same anon_inode,
-	 * so we can't filter VMAs by inode. Pass 0 to skip inode filter.
-	 */
-	if (collect_io_uring_vmas(pid, 0, &vmas, &n_vmas))
-		return -1;
-
-	/*
 	 * If fdinfo didn't provide sq_entries (kernel 5.15), derive from
 	 * the SQE VMA size: entries = vma_size / sizeof(struct io_uring_sqe).
 	 * sizeof(io_uring_sqe) is 64 bytes.
@@ -248,7 +240,7 @@ static int dump_one_io_uring_fd(pid_t pid, int fd, struct cr_img *fdinfo_img)
 		}
 		if (iue.sq_entries == 0) {
 			pr_err("Can't determine io_uring sq_entries from VMAs\n");
-			goto out;
+			return -1;
 		}
 		pr_info("Derived sq_entries=%u from SQE VMA size\n", iue.sq_entries);
 	}
@@ -261,7 +253,7 @@ static int dump_one_io_uring_fd(pid_t pid, int fd, struct cr_img *fdinfo_img)
 	if (n_vmas > 0) {
 		vma_ptrs = xmalloc(n_vmas * sizeof(IoUringVma *));
 		if (!vma_ptrs)
-			goto out;
+			return -1;
 		for (i = 0; i < n_vmas; i++)
 			vma_ptrs[i] = &vmas[i];
 	}
@@ -307,25 +299,69 @@ static int dump_one_io_uring_fd(pid_t pid, int fd, struct cr_img *fdinfo_img)
 	ret = pb_write_one(fdinfo_img, &fde, PB_FDINFO);
 out:
 	xfree(vma_ptrs);
-	xfree(vmas);
 	return ret;
+}
+
+static int cmp_vma_addr(const void *a, const void *b)
+{
+	const IoUringVma *va = a, *vb = b;
+
+	if (va->addr < vb->addr)
+		return -1;
+	if (va->addr > vb->addr)
+		return 1;
+	return 0;
 }
 
 /*
  * Dump io_uring fds directly using /proc/PID paths.
  * io_uring fds cannot be sent via SCM_RIGHTS, so we bypass
  * the parasite fd drain and read everything from proc.
+ *
+ * On kernel 5.15, all io_uring VMAs share the same anon_inode inode,
+ * so we can't filter VMAs by inode per-fd. Instead, collect ALL VMAs
+ * once, sort by address, and distribute them evenly across fds.
+ * This works because the kernel allocates VMAs for a single ring in
+ * adjacent address space, and the intercept library reinitializes
+ * rings after restore anyway — only non-overlapping assignment matters.
  */
 int dump_io_uring_fds(pid_t pid, int *fds, int nr_fds, struct cr_img *fdinfo_img)
 {
+	IoUringVma *all_vmas = NULL;
+	size_t total_vmas = 0;
+	int vmas_per_fd;
 	int i, ret = 0;
 
+	if (nr_fds == 0)
+		return 0;
+
+	/* Collect ALL io_uring VMAs once (inode=0 skips filter) */
+	if (collect_io_uring_vmas(pid, 0, &all_vmas, &total_vmas))
+		return -1;
+
+	/* Sort by address for stable grouping */
+	qsort(all_vmas, total_vmas, sizeof(IoUringVma), cmp_vma_addr);
+
+	vmas_per_fd = (nr_fds > 0) ? total_vmas / nr_fds : 0;
+
+	pr_info("pid %d: %zu io_uring VMAs across %d fds (%d per fd)\n",
+		pid, total_vmas, nr_fds, vmas_per_fd);
+
 	for (i = 0; i < nr_fds; i++) {
-		ret = dump_one_io_uring_fd(pid, fds[i], fdinfo_img);
+		IoUringVma *fd_vmas = &all_vmas[i * vmas_per_fd];
+		int fd_nvmas = vmas_per_fd;
+
+		/* Last fd gets any remainder */
+		if (i == nr_fds - 1)
+			fd_nvmas = total_vmas - i * vmas_per_fd;
+
+		ret = dump_one_io_uring_fd(pid, fds[i], fdinfo_img,
+					   fd_vmas, fd_nvmas);
 		if (ret)
 			break;
 	}
 
+	xfree(all_vmas);
 	return ret;
 }
 

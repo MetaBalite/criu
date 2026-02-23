@@ -1108,6 +1108,10 @@ static int restore_io_uring_ring(struct rst_io_uring *ring)
 	p.flags = flags;
 	p.cq_entries = ring->cq_entries;
 
+	pr_err("io_uring: restoring fd=%u sq=%u cq=%u flags=%#x n_vmas=%u\n",
+	       ring->fd, ring->sq_entries, ring->cq_entries,
+	       ring->setup_flags, ring->n_vmas);
+
 	ring_fd = sys_io_uring_setup(ring->sq_entries, &p);
 	if (ring_fd < 0) {
 		pr_err("io_uring_setup(sq=%u, flags=%#x) failed: %ld\n",
@@ -1115,8 +1119,8 @@ static int restore_io_uring_ring(struct rst_io_uring *ring)
 		return -1;
 	}
 
-	pr_debug("io_uring: setup fd=%ld sq=%u cq=%u (target fd=%u)\n",
-		 ring_fd, p.sq_entries, p.cq_entries, ring->fd);
+	pr_err("io_uring: setup fd=%ld sq=%u cq=%u (target fd=%u)\n",
+	       ring_fd, p.sq_entries, p.cq_entries, ring->fd);
 
 	/* mmap ring VMAs at original addresses */
 	for (i = 0; i < ring->n_vmas; i++) {
@@ -1129,9 +1133,11 @@ static int restore_io_uring_ring(struct rst_io_uring *ring)
 				  PROT_READ | PROT_WRITE,
 				  MAP_SHARED | MAP_FIXED | MAP_POPULATE,
 				  ring_fd, pgoff);
+		pr_err("io_uring: mmap addr=%lx size=%lx pgoff=%lx -> %lx\n",
+		       addr, size, pgoff, mapped);
 		if (mapped != (long)addr) {
-			pr_err("io_uring mmap(addr=%lx, size=%lx, pgoff=%lx) failed: %ld\n",
-			       addr, size, pgoff, mapped);
+			pr_err("io_uring mmap failed (expected %lx got %ld)\n",
+			       addr, mapped);
 			sys_close(ring_fd);
 			return -1;
 		}
@@ -1154,17 +1160,17 @@ static int restore_io_uring_ring(struct rst_io_uring *ring)
 	/* Place ring fd at the correct descriptor number */
 	if ((unsigned long)ring_fd != ring->fd) {
 		ret = sys_dup2(ring_fd, ring->fd);
+		pr_err("io_uring: dup2(%ld, %u) -> %ld\n",
+		       ring_fd, ring->fd, ret);
 		if (ret < 0) {
-			pr_err("io_uring dup2(%ld, %u) failed: %ld\n",
-			       ring_fd, ring->fd, ret);
 			sys_close(ring_fd);
 			return -1;
 		}
 		sys_close(ring_fd);
 	}
 
-	pr_info("io_uring: restored fd=%u sq=%u cq=%u vmas=%u\n",
-		ring->fd, ring->sq_entries, ring->cq_entries, ring->n_vmas);
+	pr_err("io_uring: restored fd=%u sq=%u cq=%u vmas=%u\n",
+	       ring->fd, ring->sq_entries, ring->cq_entries, ring->n_vmas);
 	return 0;
 }
 
