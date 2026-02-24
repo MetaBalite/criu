@@ -2114,9 +2114,10 @@ __visible long __export_restore_task(struct task_restore_args *args)
 	 * Restore io_uring rings. Must happen after unmap_old_vmas()
 	 * since io_uring_setup() creates kernel VMAs.
 	 */
-	for (i = 0; i < args->io_urings_n; i++)
+	for (i = 0; i < args->io_urings_n; i++) {
 		if (restore_io_uring_ring(&args->io_urings[i]) < 0)
 			goto core_restore_end;
+	}
 
 	/*
 	 * Finally restore madivse() bits
