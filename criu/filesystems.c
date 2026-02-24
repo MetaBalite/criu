@@ -737,6 +737,31 @@ static int always_fail(struct mount_info *pm)
 	return -1;
 }
 
+/*
+ * binfmt_misc mount handler: try the real mount, fall back to an empty tmpfs.
+ * binfmt_misc is a pseudo-filesystem for registering binary format handlers.
+ * Containers often lack CAP_SYS_ADMIN to mount it, and it holds no application
+ * state. Mounting tmpfs as a placeholder keeps the mount tree consistent so
+ * CRIU's ghost cleanup and depopulate_roots_yard don't fail with EINVAL.
+ */
+static int binfmt_misc_mount(struct mount_info *mi, const char *src,
+			     const char *fstype, unsigned long mountflags)
+{
+	int ret;
+
+	ret = mount(src, service_mountpoint(mi), fstype, mountflags, mi->options);
+	if (ret == 0)
+		return 0;
+
+	pr_warn("Can't mount binfmt_misc at %s: %s, using tmpfs placeholder\n",
+		service_mountpoint(mi), strerror(errno));
+
+	ret = mount("tmpfs", service_mountpoint(mi), "tmpfs", mountflags, NULL);
+	if (ret)
+		pr_perror("Can't mount tmpfs placeholder at %s", service_mountpoint(mi));
+	return ret;
+}
+
 static struct fstype fstypes[] = {
 	{
 		.name = "unsupported",
@@ -763,6 +788,7 @@ static struct fstype fstypes[] = {
 	{
 		.name = "binfmt_misc",
 		.code = FSTYPE__BINFMT_MISC,
+		.mount = binfmt_misc_mount,
 	},
 	{
 		.name = "tmpfs",
