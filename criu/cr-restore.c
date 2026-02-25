@@ -2194,9 +2194,13 @@ skip_ns_bouncing:
 	/*
 	 * There is no need to call try_clean_remaps() after this point,
 	 * as restore went OK and all ghosts were removed by the openers.
+	 *
+	 * With MntnsCompatMode or hostPID containers, setns into the
+	 * restored mount namespace may fail (EINVAL). This is non-fatal:
+	 * the restore is complete, processes are alive.
 	 */
 	if (depopulate_roots_yard(mnt_ns_fd, false))
-		goto out_kill;
+		pr_warn("Failed to depopulate roots yard, continuing anyway\n");
 
 	close_safe(&mnt_ns_fd);
 
