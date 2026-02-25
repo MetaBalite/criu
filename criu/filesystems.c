@@ -415,8 +415,8 @@ int binfmt_misc_restore_sandboxed(pid_t pid, BinfmtMiscEntry **bmes, size_t n)
 		return 0;
 
 	if (!kdat.has_binfmt_misc_sandboxing) {
-		pr_err("binfmt_misc sandboxing is not supported\n");
-		return -1;
+		pr_warn("binfmt_misc sandboxing is not supported, skipping %zu entries\n", n);
+		return 0;
 	}
 
 	mnt_fd = mount_detached_fs("binfmt_misc");
