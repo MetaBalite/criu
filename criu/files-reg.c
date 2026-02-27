@@ -1412,6 +1412,20 @@ static int check_path_remap(struct fd_link *link, const struct fd_parms *parms, 
 
 		if (errno == ENOENT) {
 			link_strip_deleted(link);
+
+			/*
+			 * For tmpfs, link_remap files are created on the
+			 * in-memory filesystem and are NOT persisted in the
+			 * checkpoint image. On restore the tmpfs is fresh
+			 * (e.g., K8s emptyDir for /dev/shm), so the remap
+			 * file won't exist and restore will fail with ENOENT.
+			 * Use ghost file instead — it's saved in the image.
+			 */
+			if (parms->fs_type == TMPFS_MAGIC) {
+				pr_info("tmpfs: using ghost instead of link-remap for %s\n", rpath + 1);
+				return dump_ghost_remap(rpath + 1, ost, lfd, id, nsid);
+			}
+
 			ret = dump_linked_remap(rpath + 1, plen - 1, parms, lfd, id, nsid, &fallback);
 			if (ret < 0 && fallback) {
 				/* fallback is true only if following conditions are true:
