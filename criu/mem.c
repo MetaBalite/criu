@@ -975,7 +975,10 @@ static int premap_private_vma(struct pstree_item *t, struct vma_area *vma, void 
 			    vma->e->pgoff);
 
 		if (addr == MAP_FAILED) {
-			pr_perror("Unable to map ANON_VMA");
+			pr_perror("Unable to map VMA %#lx-%#lx fd=%ld flags=%#x status=%#x vm_open=%d",
+				  (unsigned long)vma->e->start, (unsigned long)vma->e->end,
+				  (long)vma->e->fd, (unsigned)vma->e->flags, (unsigned)vma->e->status,
+				  vma->vm_open ? 1 : 0);
 			return -1;
 		}
 	} else {
