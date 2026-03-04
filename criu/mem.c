@@ -945,18 +945,10 @@ static int premap_private_vma(struct pstree_item *t, struct vma_area *vma, void 
 		 * Restore AIO ring buffer content to temporary anonymous area.
 		 * This will be placed in io_setup'ed AIO in restore_aio_ring().
 		 */
-		if (vma_entry_is(vma->e, VMA_AREA_AIORING))
+		if (vma_entry_is(vma->e, VMA_AREA_AIORING) ||
+		    vma_entry_is(vma->e, VMA_AREA_IORING))
 			flag |= MAP_ANONYMOUS;
-		else if (vma->vm_open && (vma_area_is(vma, VMA_FILE_PRIVATE) ||
-					  vma_area_is(vma, VMA_FILE_SHARED))) {
-			/*
-			 * Open the backing file for file-mapped VMAs.
-			 * This sets vma->e->fd to a valid fd for the mmap below.
-			 * In non-streaming mode, only FILE_PRIVATE VMAs reach here
-			 * (others are handled by the PIE restorer). In streaming
-			 * mode (pieok=false), ALL VMAs are premapped, so we must
-			 * open the file for shared mappings too.
-			 */
+		else if (vma_area_is(vma, VMA_FILE_PRIVATE)) {
 			ret = vma->vm_open(vpid(t), vma);
 			if (ret < 0) {
 				pr_err("Can't fixup VMA's fd\n");
