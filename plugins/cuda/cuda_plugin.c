@@ -376,6 +376,11 @@ int cuda_plugin_checkpoint_devices(int pid)
 		return -ENOTSUP;
 	}
 
+	if (getenv("CRYO_SKIP_CUDA_CHECKPOINT")) {
+		pr_info("skipping cuda-checkpoint checkpoint for pid %d (CRYO_SKIP_CUDA_CHECKPOINT)\n", pid);
+		return 0;
+	}
+
 	restore_tid = get_cuda_restore_tid(pid);
 
 	/* We can possibly hit a race with cuInit() where we are past the point of
@@ -435,6 +440,11 @@ int cuda_plugin_pause_devices(int pid)
 
 	if (plugin_disabled) {
 		return -ENOTSUP;
+	}
+
+	if (getenv("CRYO_SKIP_CUDA_CHECKPOINT")) {
+		pr_info("skipping cuda-checkpoint pause for pid %d (CRYO_SKIP_CUDA_CHECKPOINT)\n", pid);
+		return 0;
 	}
 
 	restore_tid = get_cuda_restore_tid(pid);
@@ -567,6 +577,11 @@ int cuda_plugin_resume_devices_late(int pid)
 
 	if (plugin_disabled) {
 		return -ENOTSUP;
+	}
+
+	if (getenv("CRYO_SKIP_CUDA_CHECKPOINT")) {
+		pr_info("skipping cuda-checkpoint resume for pid %d (CRYO_SKIP_CUDA_CHECKPOINT)\n", pid);
+		return 0;
 	}
 
 	/* RESUME_DEVICES_LATE is used during `criu restore`.
