@@ -54,6 +54,7 @@ bool plugin_added_to_inventory = false;
 
 /* Forward declarations */
 static int scan_and_save_nvidia_fds(int pid);
+static const char *get_images_dir(void);
 
 struct pid_info {
 	int pid;
@@ -417,6 +418,11 @@ int cuda_plugin_checkpoint_devices(int pid)
 		return 0;
 	}
 
+	if (getenv("CRYO_MULTI_GPU_TEARDOWN")) {
+		pr_info("multi-GPU teardown: skipping Checkpoint for pid %d\n", pid);
+		return 0;
+	}
+
 	restore_tid = get_cuda_restore_tid(pid);
 
 	/* We can possibly hit a race with cuInit() where we are past the point of
@@ -480,6 +486,22 @@ int cuda_plugin_pause_devices(int pid)
 
 	if (getenv("CRYO_SKIP_CUDA_CHECKPOINT")) {
 		pr_info("skipping cuda-checkpoint pause for pid %d (CRYO_SKIP_CUDA_CHECKPOINT)\n", pid);
+		return 0;
+	}
+
+	/* Multi-GPU clean teardown path: the in-process quiesce handler already
+	 * did cudaFree + cuDevicePrimaryCtxReset + FD closure + VMA overlay.
+	 * Skip Lock (it would fail — nvidia FDs are gone). Just add to inventory
+	 * so the plugin loads during restore for .bss zeroing. */
+	if (getenv("CRYO_MULTI_GPU_TEARDOWN")) {
+		pr_info("multi-GPU teardown: skipping Lock for pid %d (in-process teardown handled GPU state)\n", pid);
+		if (!plugin_added_to_inventory) {
+			if (add_inventory_plugin(CR_PLUGIN_DESC.name)) {
+				pr_err("Failed to add CUDA plugin to inventory\n");
+				return -1;
+			}
+			plugin_added_to_inventory = true;
+		}
 		return 0;
 	}
 
@@ -607,6 +629,154 @@ interrupt:
 	return ret != 0 ? ret : int_ret;
 }
 
+/*
+ * Zero libcuda.so's writable segments in a frozen process via /proc/<pid>/mem.
+ * Reads segment addresses from <checkpoint_dir>/libcuda-bss-<container_pid>.txt
+ * (written during checkpoint by cryo_gpu_clean_teardown).
+ *
+ * This clears stale CUDA driver globals (initialized, pid, mutexes, RM handles)
+ * so cuInit(0) can reinitialize from a clean slate when the process resumes.
+ *
+ * Called from resume_devices_late while all threads except the restore thread
+ * are frozen by CRIU — no thread race.
+ */
+/*
+ * Get the container (innermost namespace) PID for a host PID.
+ * Reads the NSpid line from /proc/<host_pid>/status.
+ * Returns the innermost PID, or -1 on failure.
+ */
+static int get_container_pid(int host_pid)
+{
+	FILE *f;
+	char line[256];
+	char path[64];
+	int container_pid = -1;
+
+	snprintf(path, sizeof(path), "/proc/%d/status", host_pid);
+	f = fopen(path, "r");
+	if (!f)
+		return -1;
+
+	while (fgets(line, sizeof(line), f)) {
+		if (strncmp(line, "NSpid:", 6) != 0)
+			continue;
+		/* NSpid: <host_pid> [<intermediate>...] <container_pid>
+		 * The last field is the innermost (container) PID. */
+		char *p = line + 6;
+		char *last_token = NULL;
+		char *tok = strtok(p, " \t\n");
+		while (tok) {
+			last_token = tok;
+			tok = strtok(NULL, " \t\n");
+		}
+		if (last_token)
+			container_pid = atoi(last_token);
+		break;
+	}
+
+	fclose(f);
+	return container_pid;
+}
+
+/*
+ * Reset CUDA driver init state in a frozen process to allow cuInit reinit.
+ *
+ * The CUDA driver uses a `pidLocks` struct (separate from `globals`) to gate
+ * one-time initialization via cuiGlobalMutexInitOnce(). It contains 4 PID
+ * fields: initOnceBeginPid, initOnceEndPid, apiInitOnceBeginPid, apiInitOnceEndPid.
+ * All set to the process PID during first cuInit.
+ *
+ * After CRIU restore with PID preservation, pidLocks still has the original PID.
+ * cuiGlobalMutexInitOnce sees initOnceBeginPid == thisPid and skips reinit.
+ *
+ * By zeroing pidLocks, cuiGlobalMutexInitOnce enters the "else" branch which:
+ *   1. memset(&globals, 0, sizeof(globals)) — full globals reset
+ *   2. InitializeCriticalSections() — fresh mutexes
+ *   3. cuInit proceeds with full driver initialization
+ *
+ * We scan libcuda.so's writable segment for 4 consecutive int32 fields all
+ * matching the container PID — that's the pidLocks struct (16 bytes).
+ */
+
+static int patch_libcuda_globals(int host_pid)
+{
+	int container_pid = get_container_pid(host_pid);
+	if (container_pid <= 0)
+		return 0;
+
+	/* Read checkpoint path from env (set by restore-entrypoint before criu restore).
+	 * get_images_dir() returns CWD when opts.imgs_dir is null during RPC restore. */
+	const char *ckpt_dir = getenv("CRYO_CHECKPOINT_PATH");
+	if (!ckpt_dir)
+		ckpt_dir = get_images_dir();
+
+	char filepath[PATH_MAX];
+	int n = snprintf(filepath, sizeof(filepath), "%s/libcuda-bss-%d.txt",
+			 ckpt_dir, container_pid);
+	if (n >= (int)sizeof(filepath))
+		return 0;
+
+	FILE *fp = fopen(filepath, "r");
+	if (!fp)
+		return 0;
+
+	char mem_path[64];
+	snprintf(mem_path, sizeof(mem_path), "/proc/%d/mem", host_pid);
+	int mem_fd = open(mem_path, O_RDWR);
+	if (mem_fd < 0) {
+		pr_warn("CUDA plugin: can't open %s: %s\n", mem_path, strerror(errno));
+		fclose(fp);
+		return 0;
+	}
+
+	int patched = 0;
+	unsigned long seg_addr;
+	size_t seg_size;
+
+	while (fscanf(fp, "%lx %zu", &seg_addr, &seg_size) == 2) {
+		unsigned char *buf = (unsigned char *)calloc(1, seg_size);
+		if (!buf)
+			continue;
+
+		ssize_t rd = pread(mem_fd, buf, seg_size, (off_t)seg_addr);
+		if (rd != (ssize_t)seg_size) {
+			free(buf);
+			continue;
+		}
+
+		/* Scan for pidLocks: two consecutive int32 both == container_pid.
+		 * Confirmed by diagnostic: pidLocks layout is [pid, pid, 0, 0]
+		 * (initOnceBeginPid, initOnceEndPid, apiInitOnceBeginPid=0, apiInitOnceEndPid=0).
+		 * globals.pid is an isolated match — NOT consecutive. */
+		int32_t pid32 = (int32_t)container_pid;
+		for (size_t off = 0; off + 2 * sizeof(int32_t) <= seg_size; off += 4) {
+			int32_t v0, v1;
+			memcpy(&v0, buf + off, sizeof(v0));
+			memcpy(&v1, buf + off + 4, sizeof(v1));
+
+			if (v0 == pid32 && v1 == pid32) {
+				/* Found pidLocks — zero all 16 bytes (4 fields) */
+				unsigned char zeros[16] = {0};
+				if (pwrite(mem_fd, zeros, sizeof(zeros),
+					   (off_t)(seg_addr + off)) == sizeof(zeros)) {
+					pr_info("CUDA plugin: zeroed pidLocks at 0x%lx "
+						"(seg+0x%lx, pid=%d, host pid %d)\n",
+						seg_addr + off, (unsigned long)off,
+						container_pid, host_pid);
+					patched++;
+				}
+				break;
+			}
+		}
+		free(buf);
+	}
+
+	close(mem_fd);
+	fclose(fp);
+
+	return patched;
+}
+
 int cuda_plugin_resume_devices_late(int pid)
 {
 	int ret;
@@ -620,20 +790,23 @@ int cuda_plugin_resume_devices_late(int pid)
 		return 0;
 	}
 
-	/* RESUME_DEVICES_LATE is used during `criu restore`.
-	 * Here, we assume that users expect the target process
-	 * to be in a "running" state after restore, even if it was
-	 * in a "locked" or "checkpointed" state during `criu dump`.
-	 *
-	 * If cuda-checkpoint is not available or fails, we continue anyway.
-	 * The application may be using external GPU checkpoint/restore
-	 * (e.g., via GPUCR library and SIGUSR1/SIGUSR2 signals).
-	 */
+	/* Multi-GPU clean teardown path: the driver was properly shut down
+	 * before dump (cuDevicePrimaryCtxReset + FD closure). cuda-checkpoint
+	 * Restore+Unlock won't work (process wasn't CHECKPOINTED).
+	 * Instead, zero libcuda.so's .bss so cuInit can reinitialize cleanly
+	 * when the in-process restore handler runs after resume. */
+	int patched = patch_libcuda_globals(pid);
+	if (patched > 0) {
+		pr_info("CUDA plugin: multi-GPU restore: patched %d CUDA globals for pid %d, "
+			"skipping cuda-checkpoint Restore+Unlock\n", patched, pid);
+		return 0;
+	}
+
+	/* Standard path: call cuda-checkpoint Restore + Unlock */
 	ret = resume_device(pid, 1, CUDA_TASK_RUNNING);
 	if (ret != 0) {
 		pr_warn("CUDA plugin: resume_device failed for PID %d (ret=%d), "
 			"continuing anyway (external GPU restore may be used)\n", pid, ret);
-		/* Return 0 to not fail the restore - let external restore handle it */
 		return 0;
 	}
 	return 0;
